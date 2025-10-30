@@ -1,2 +1,0 @@
-# tokenized-asset-management
-ss
