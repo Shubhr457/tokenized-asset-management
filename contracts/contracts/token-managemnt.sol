@@ -4,11 +4,15 @@ pragma solidity ^0.8.20;
 import "@openzeppelin/contracts/token/ERC721/ERC721.sol";
 import "@openzeppelin/contracts/access/AccessControl.sol";
 import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/utils/Pausable.sol";
 
-contract AssetTokenization is ERC721, AccessControl, ReentrancyGuard {
+contract AssetTokenization is ERC721, AccessControl, ReentrancyGuard, Pausable {
     bytes32 public constant ADMIN_ROLE = keccak256("ADMIN_ROLE");
     bytes32 public constant MINTER_ROLE = keccak256("MINTER_ROLE");
     bytes32 public constant COMPLIANCE_ROLE = keccak256("COMPLIANCE_ROLE");
+    
+    // Constants for batch operations
+    uint256 public constant MAX_BATCH_SIZE = 100;
     
     // Asset lifecycle states
     enum AssetStatus { Pending, Active, Frozen, Delisted }
@@ -35,6 +39,9 @@ contract AssetTokenization is ERC721, AccessControl, ReentrancyGuard {
     mapping(uint256 => TransferRecord[]) public transferHistory;
     mapping(address => bool) public verifiedUsers;
     
+    // Track if transfer was already recorded to prevent duplicates
+    mapping(uint256 => bool) private _transferRecordedInUpdate;
+    
     uint256 private _nextTokenId;
     
     // Events
@@ -56,6 +63,9 @@ contract AssetTokenization is ERC721, AccessControl, ReentrancyGuard {
     event MetadataUpdated(uint256 indexed assetId, string newMetadataURI);
     event UserVerified(address indexed user, bool status);
     event ValuationUpdated(uint256 indexed assetId, uint256 newValuation);
+    event BatchVerificationCompleted(uint256 count, bool status);
+    event ContractPaused(address indexed by);
+    event ContractUnpaused(address indexed by);
     
     constructor(string memory name, string memory symbol) 
         ERC721(name, symbol) 
@@ -67,6 +77,17 @@ contract AssetTokenization is ERC721, AccessControl, ReentrancyGuard {
         
         // Admin is automatically verified
         verifiedUsers[msg.sender] = true;
+    }
+    
+    // Emergency pause functions
+    function pause() external onlyRole(ADMIN_ROLE) {
+        _pause();
+        emit ContractPaused(msg.sender);
+    }
+    
+    function unpause() external onlyRole(ADMIN_ROLE) {
+        _unpause();
+        emit ContractUnpaused(msg.sender);
     }
     
     // Register and mint new asset with full details
@@ -108,10 +129,15 @@ contract AssetTokenization is ERC721, AccessControl, ReentrancyGuard {
         public 
         onlyRole(COMPLIANCE_ROLE) 
     {
+        require(users.length > 0, "Empty array");
+        require(users.length <= MAX_BATCH_SIZE, "Batch too large");
+        
         for (uint256 i = 0; i < users.length; i++) {
             verifiedUsers[users[i]] = status;
             emit UserVerified(users[i], status);
         }
+        
+        emit BatchVerificationCompleted(users.length, status);
     }
     
     // Set asset compliance status
@@ -150,9 +176,12 @@ contract AssetTokenization is ERC721, AccessControl, ReentrancyGuard {
         address to,
         uint256 assetId,
         uint256 price
-    ) public nonReentrant {
+    ) public nonReentrant whenNotPaused {
         require(_isAuthorized(_ownerOf(assetId), msg.sender, assetId), "Not authorized");
         require(verifiedUsers[to], "Recipient not verified");
+        
+        // Mark that we're recording this transfer to prevent duplicate in _update
+        _transferRecordedInUpdate[assetId] = true;
         
         transferHistory[assetId].push(TransferRecord({
             from: from,
@@ -173,16 +202,20 @@ contract AssetTokenization is ERC721, AccessControl, ReentrancyGuard {
     ) internal override returns (address) {
         address from = _ownerOf(tokenId);
         
-        // Skip checks on minting
+        // Pause only affects transfers, not minting
+        if (from != address(0) && paused()) {
+            revert EnforcedPause();
+        }
+        
+        // Skip compliance checks on minting (from == address(0))
         if (from != address(0)) {
             AssetInfo memory info = assetDetails[tokenId];
             require(info.isCompliant, "Asset not compliant");
             require(info.status == AssetStatus.Active, "Asset not active");
             require(verifiedUsers[to], "Recipient not verified");
             
-            // Record transfer with zero price (for standard transfers)
-            if (transferHistory[tokenId].length == 0 || 
-                transferHistory[tokenId][transferHistory[tokenId].length - 1].to != to) {
+            // Only record transfer if not already recorded by transferWithPrice
+            if (!_transferRecordedInUpdate[tokenId]) {
                 transferHistory[tokenId].push(TransferRecord({
                     from: from,
                     to: to,
@@ -191,6 +224,9 @@ contract AssetTokenization is ERC721, AccessControl, ReentrancyGuard {
                 }));
             }
         }
+        
+        // Reset the flag after transfer
+        _transferRecordedInUpdate[tokenId] = false;
         
         return super._update(to, tokenId, auth);
     }

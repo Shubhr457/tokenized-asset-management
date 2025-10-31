@@ -1,20 +1,41 @@
-import { body } from 'express-validator';
+import Joi from 'joi';
 
-export const createUserValidation = [
-  body('walletAddress').isEthereumAddress().withMessage('Invalid Ethereum address'),
-  body('email').isEmail().withMessage('Invalid email address'),
-  body('firstName').notEmpty().withMessage('First name is required'),
-  body('lastName').notEmpty().withMessage('Last name is required'),
-  body('phone').optional().isString()
-];
+// Custom Joi validator for Ethereum addresses
+const ethereumAddress = Joi.string().pattern(/^0x[a-fA-F0-9]{40}$/).messages({
+  'string.pattern.base': 'Invalid Ethereum address'
+});
 
-export const verifyUserValidation = [
-  body('status').isBoolean().withMessage('Status must be a boolean')
-];
+export const createUserSchema = Joi.object({
+  walletAddress: ethereumAddress.required(),
+  email: Joi.string().email().required().messages({
+    'string.email': 'Invalid email address'
+  }),
+  firstName: Joi.string().required().messages({
+    'string.empty': 'First name is required',
+    'any.required': 'First name is required'
+  }),
+  lastName: Joi.string().required().messages({
+    'string.empty': 'Last name is required',
+    'any.required': 'Last name is required'
+  }),
+  phone: Joi.string().optional()
+});
 
-export const batchVerifyValidation = [
-  body('users').isArray({ min: 1 }).withMessage('Users must be a non-empty array'),
-  body('users.*').isEthereumAddress().withMessage('Invalid Ethereum address'),
-  body('status').isBoolean().withMessage('Status must be a boolean')
-];
+export const verifyUserSchema = Joi.object({
+  status: Joi.boolean().required().messages({
+    'boolean.base': 'Status must be a boolean',
+    'any.required': 'Status is required'
+  })
+});
+
+export const batchVerifySchema = Joi.object({
+  users: Joi.array().items(ethereumAddress).min(1).required().messages({
+    'array.min': 'Users must be a non-empty array',
+    'any.required': 'Users array is required'
+  }),
+  status: Joi.boolean().required().messages({
+    'boolean.base': 'Status must be a boolean',
+    'any.required': 'Status is required'
+  })
+});
 

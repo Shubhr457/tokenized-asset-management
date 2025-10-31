@@ -159,7 +159,7 @@ describe("AssetTokenization", function () {
       await contract.grantRole(COMPLIANCE_ROLE, compliance.address);
       
       await expect(contract.connect(compliance).batchVerifyUsers([], true))
-        .to.not.be.reverted;
+        .to.be.revertedWith("Empty array");
     });
 
     it("Should handle batch unverification", async function () {
@@ -1104,5 +1104,417 @@ describe("AssetTokenization", function () {
       expect(await contract.supportsInterface("0x12345678")).to.be.false;
     });
   });
+
+  describe("Pausable Functionality", function () {
+    it("Should allow ADMIN_ROLE to pause the contract", async function () {
+      const { contract, owner } = await loadFixture(deployAssetTokenizationFixture);
+      
+      await expect(contract.pause())
+        .to.emit(contract, "ContractPaused")
+        .withArgs(owner.address);
+      
+      expect(await contract.paused()).to.be.true;
+    });
+
+    it("Should allow ADMIN_ROLE to unpause the contract", async function () {
+      const { contract, owner } = await loadFixture(deployAssetTokenizationFixture);
+      
+      await contract.pause();
+      expect(await contract.paused()).to.be.true;
+      
+      await expect(contract.unpause())
+        .to.emit(contract, "ContractUnpaused")
+        .withArgs(owner.address);
+      
+      expect(await contract.paused()).to.be.false;
+    });
+
+    it("Should prevent non-ADMIN from pausing", async function () {
+      const { contract, user1 } = await loadFixture(deployAssetTokenizationFixture);
+      
+      await expect(
+        contract.connect(user1).pause()
+      ).to.be.revertedWithCustomError(contract, "AccessControlUnauthorizedAccount");
+    });
+
+    it("Should prevent non-ADMIN from unpausing", async function () {
+      const { contract, owner, user1 } = await loadFixture(deployAssetTokenizationFixture);
+      
+      await contract.pause();
+      
+      await expect(
+        contract.connect(user1).unpause()
+      ).to.be.revertedWithCustomError(contract, "AccessControlUnauthorizedAccount");
+    });
+
+    it("Should prevent transfers when paused", async function () {
+      const { contract, owner, compliance, user1, user2 } = await loadFixture(deployAssetTokenizationFixture);
+      const COMPLIANCE_ROLE = await contract.COMPLIANCE_ROLE();
+      
+      // Setup: Register and activate asset
+      await contract.grantRole(COMPLIANCE_ROLE, compliance.address);
+      await contract.connect(compliance).setUserVerification(user1.address, true);
+      await contract.connect(compliance).setUserVerification(user2.address, true);
+      
+      const assetId = 0;
+      await contract.registerAsset(user1.address, "ipfs://test", "property", ethers.parseEther("100"));
+      await contract.connect(compliance).setCompliance(assetId, true);
+      await contract.setAssetStatus(assetId, 1); // Active
+      
+      // Pause contract
+      await contract.pause();
+      
+      // Try to transfer
+      await expect(
+        contract.connect(user1).transferFrom(user1.address, user2.address, assetId)
+      ).to.be.revertedWithCustomError(contract, "EnforcedPause");
+    });
+
+    it("Should prevent transferWithPrice when paused", async function () {
+      const { contract, owner, compliance, user1, user2 } = await loadFixture(deployAssetTokenizationFixture);
+      const COMPLIANCE_ROLE = await contract.COMPLIANCE_ROLE();
+      
+      // Setup
+      await contract.grantRole(COMPLIANCE_ROLE, compliance.address);
+      await contract.connect(compliance).setUserVerification(user1.address, true);
+      await contract.connect(compliance).setUserVerification(user2.address, true);
+      
+      const assetId = 0;
+      await contract.registerAsset(user1.address, "ipfs://test", "property", ethers.parseEther("100"));
+      await contract.connect(compliance).setCompliance(assetId, true);
+      await contract.setAssetStatus(assetId, 1);
+      
+      // Pause contract
+      await contract.pause();
+      
+      await expect(
+        contract.connect(user1).transferWithPrice(user1.address, user2.address, assetId, ethers.parseEther("50"))
+      ).to.be.revertedWithCustomError(contract, "EnforcedPause");
+    });
+
+    it("Should allow minting when paused (admin operations)", async function () {
+      const { contract, owner, compliance, user1 } = await loadFixture(deployAssetTokenizationFixture);
+      const COMPLIANCE_ROLE = await contract.COMPLIANCE_ROLE();
+      
+      await contract.grantRole(COMPLIANCE_ROLE, compliance.address);
+      await contract.connect(compliance).setUserVerification(user1.address, true);
+      
+      await contract.pause();
+      
+      // Minting should still work (no transfer from previous owner)
+      await expect(
+        contract.registerAsset(user1.address, "ipfs://test", "property", ethers.parseEther("100"))
+      ).to.not.be.reverted;
+    });
+  });
+
+  describe("Batch Operation Limits", function () {
+    it("Should enforce maximum batch size", async function () {
+      const { contract, owner, compliance } = await loadFixture(deployAssetTokenizationFixture);
+      const COMPLIANCE_ROLE = await contract.COMPLIANCE_ROLE();
+      
+      await contract.grantRole(COMPLIANCE_ROLE, compliance.address);
+      
+      // Create array larger than MAX_BATCH_SIZE (100)
+      const largeArray = new Array(101).fill(0).map((_, i) => ethers.Wallet.createRandom().address);
+      
+      await expect(
+        contract.connect(compliance).batchVerifyUsers(largeArray, true)
+      ).to.be.revertedWith("Batch too large");
+    });
+
+    it("Should reject empty array in batch verification", async function () {
+      const { contract, owner, compliance } = await loadFixture(deployAssetTokenizationFixture);
+      const COMPLIANCE_ROLE = await contract.COMPLIANCE_ROLE();
+      
+      await contract.grantRole(COMPLIANCE_ROLE, compliance.address);
+      
+      await expect(
+        contract.connect(compliance).batchVerifyUsers([], true)
+      ).to.be.revertedWith("Empty array");
+    });
+
+    it("Should successfully process maximum allowed batch size", async function () {
+      const { contract, owner, compliance } = await loadFixture(deployAssetTokenizationFixture);
+      const COMPLIANCE_ROLE = await contract.COMPLIANCE_ROLE();
+      
+      await contract.grantRole(COMPLIANCE_ROLE, compliance.address);
+      
+      // Create array of exactly MAX_BATCH_SIZE (100)
+      const maxArray = new Array(100).fill(0).map((_, i) => ethers.Wallet.createRandom().address);
+      
+      await expect(
+        contract.connect(compliance).batchVerifyUsers(maxArray, true)
+      ).to.emit(contract, "BatchVerificationCompleted")
+        .withArgs(100, true);
+      
+      // Verify all users were verified
+      for (const addr of maxArray) {
+        expect(await contract.verifiedUsers(addr)).to.be.true;
+      }
+    });
+
+    it("Should emit BatchVerificationCompleted event with correct count", async function () {
+      const { contract, owner, compliance, user1, user2, user3 } = await loadFixture(deployAssetTokenizationFixture);
+      const COMPLIANCE_ROLE = await contract.COMPLIANCE_ROLE();
+      
+      await contract.grantRole(COMPLIANCE_ROLE, compliance.address);
+      
+      const users = [user1.address, user2.address, user3.address];
+      
+      await expect(
+        contract.connect(compliance).batchVerifyUsers(users, true)
+      ).to.emit(contract, "BatchVerificationCompleted")
+        .withArgs(3, true);
+    });
+  });
+
+  describe("Transfer History Logic", function () {
+    it("Should not create duplicate transfer records", async function () {
+      const { contract, owner, compliance, user1, user2 } = await loadFixture(deployAssetTokenizationFixture);
+      const COMPLIANCE_ROLE = await contract.COMPLIANCE_ROLE();
+      
+      await contract.grantRole(COMPLIANCE_ROLE, compliance.address);
+      await contract.connect(compliance).setUserVerification(user1.address, true);
+      await contract.connect(compliance).setUserVerification(user2.address, true);
+      
+      const assetId = 0;
+      await contract.registerAsset(user1.address, "ipfs://test", "property", ethers.parseEther("100"));
+      await contract.connect(compliance).setCompliance(assetId, true);
+      await contract.setAssetStatus(assetId, 1);
+      
+      // Transfer with price
+      await contract.connect(user1).transferWithPrice(user1.address, user2.address, assetId, ethers.parseEther("50"));
+      
+      const history = await contract.getTransferHistory(assetId);
+      
+      // Should have exactly 1 record
+      expect(history.length).to.equal(1);
+      expect(history[0].from).to.equal(user1.address);
+      expect(history[0].to).to.equal(user2.address);
+      expect(history[0].price).to.equal(ethers.parseEther("50"));
+    });
+
+    it("Should record standard transfer with zero price", async function () {
+      const { contract, owner, compliance, user1, user2 } = await loadFixture(deployAssetTokenizationFixture);
+      const COMPLIANCE_ROLE = await contract.COMPLIANCE_ROLE();
+      
+      await contract.grantRole(COMPLIANCE_ROLE, compliance.address);
+      await contract.connect(compliance).setUserVerification(user1.address, true);
+      await contract.connect(compliance).setUserVerification(user2.address, true);
+      
+      const assetId = 0;
+      await contract.registerAsset(user1.address, "ipfs://test", "property", ethers.parseEther("100"));
+      await contract.connect(compliance).setCompliance(assetId, true);
+      await contract.setAssetStatus(assetId, 1);
+      
+      // Standard transfer (not transferWithPrice)
+      await contract.connect(user1).transferFrom(user1.address, user2.address, assetId);
+      
+      const history = await contract.getTransferHistory(assetId);
+      
+      expect(history.length).to.equal(1);
+      expect(history[0].price).to.equal(0);
+    });
+
+    it("Should maintain correct history across multiple transfers", async function () {
+      const { contract, owner, compliance, user1, user2, user3 } = await loadFixture(deployAssetTokenizationFixture);
+      const COMPLIANCE_ROLE = await contract.COMPLIANCE_ROLE();
+      
+      await contract.grantRole(COMPLIANCE_ROLE, compliance.address);
+      await contract.connect(compliance).batchVerifyUsers([user1.address, user2.address, user3.address], true);
+      
+      const assetId = 0;
+      await contract.registerAsset(user1.address, "ipfs://test", "property", ethers.parseEther("100"));
+      await contract.connect(compliance).setCompliance(assetId, true);
+      await contract.setAssetStatus(assetId, 1);
+      
+      // Transfer 1: user1 -> user2 with price
+      await contract.connect(user1).transferWithPrice(user1.address, user2.address, assetId, ethers.parseEther("50"));
+      
+      // Transfer 2: user2 -> user3 standard transfer
+      await contract.connect(user2).transferFrom(user2.address, user3.address, assetId);
+      
+      const history = await contract.getTransferHistory(assetId);
+      
+      expect(history.length).to.equal(2);
+      expect(history[0].from).to.equal(user1.address);
+      expect(history[0].to).to.equal(user2.address);
+      expect(history[0].price).to.equal(ethers.parseEther("50"));
+      
+      expect(history[1].from).to.equal(user2.address);
+      expect(history[1].to).to.equal(user3.address);
+      expect(history[1].price).to.equal(0);
+    });
+
+    it("Should have empty history for newly minted asset", async function () {
+      const { contract, owner, compliance, user1 } = await loadFixture(deployAssetTokenizationFixture);
+      const COMPLIANCE_ROLE = await contract.COMPLIANCE_ROLE();
+      
+      await contract.grantRole(COMPLIANCE_ROLE, compliance.address);
+      await contract.connect(compliance).setUserVerification(user1.address, true);
+      
+      const assetId = 0;
+      await contract.registerAsset(user1.address, "ipfs://test", "property", ethers.parseEther("100"));
+      
+      const history = await contract.getTransferHistory(assetId);
+      expect(history.length).to.equal(0);
+    });
+  });
+
+  describe("Edge Cases and Security", function () {
+    it("Should prevent transfer to zero address", async function () {
+      const { contract, owner, compliance, user1 } = await loadFixture(deployAssetTokenizationFixture);
+      const COMPLIANCE_ROLE = await contract.COMPLIANCE_ROLE();
+      
+      await contract.grantRole(COMPLIANCE_ROLE, compliance.address);
+      await contract.connect(compliance).setUserVerification(user1.address, true);
+      
+      const assetId = 0;
+      await contract.registerAsset(user1.address, "ipfs://test", "property", ethers.parseEther("100"));
+      await contract.connect(compliance).setCompliance(assetId, true);
+      await contract.setAssetStatus(assetId, 1);
+      
+      await expect(
+        contract.connect(user1).transferFrom(user1.address, ethers.ZeroAddress, assetId)
+      ).to.be.reverted;
+    });
+
+    it("Should prevent transfer of non-existent asset", async function () {
+      const { contract, user1, user2 } = await loadFixture(deployAssetTokenizationFixture);
+      
+      await expect(
+        contract.connect(user1).transferFrom(user1.address, user2.address, 999)
+      ).to.be.reverted;
+    });
+
+    it("Should prevent unauthorized transfer", async function () {
+      const { contract, owner, compliance, user1, user2, user3 } = await loadFixture(deployAssetTokenizationFixture);
+      const COMPLIANCE_ROLE = await contract.COMPLIANCE_ROLE();
+      
+      await contract.grantRole(COMPLIANCE_ROLE, compliance.address);
+      await contract.connect(compliance).setUserVerification(user1.address, true);
+      await contract.connect(compliance).setUserVerification(user2.address, true);
+      
+      const assetId = 0;
+      await contract.registerAsset(user1.address, "ipfs://test", "property", ethers.parseEther("100"));
+      await contract.connect(compliance).setCompliance(assetId, true);
+      await contract.setAssetStatus(assetId, 1);
+      
+      // user3 tries to transfer user1's asset
+      await expect(
+        contract.connect(user3).transferFrom(user1.address, user2.address, assetId)
+      ).to.be.revertedWithCustomError(contract, "ERC721InsufficientApproval");
+    });
+
+    it("Should handle rapid pause/unpause cycles", async function () {
+      const { contract, owner } = await loadFixture(deployAssetTokenizationFixture);
+      
+      await contract.pause();
+      await contract.unpause();
+      await contract.pause();
+      await contract.unpause();
+      
+      expect(await contract.paused()).to.be.false;
+    });
+
+    it("Should prevent double pausing", async function () {
+      const { contract, owner } = await loadFixture(deployAssetTokenizationFixture);
+      
+      await contract.pause();
+      
+      await expect(
+        contract.pause()
+      ).to.be.revertedWithCustomError(contract, "EnforcedPause");
+    });
+
+    it("Should prevent double unpausing", async function () {
+      const { contract, owner } = await loadFixture(deployAssetTokenizationFixture);
+      
+      await expect(
+        contract.unpause()
+      ).to.be.revertedWithCustomError(contract, "ExpectedPause");
+    });
+
+    it("Should handle compliance status change during transfer attempt", async function () {
+      const { contract, owner, compliance, user1, user2 } = await loadFixture(deployAssetTokenizationFixture);
+      const COMPLIANCE_ROLE = await contract.COMPLIANCE_ROLE();
+      
+      await contract.grantRole(COMPLIANCE_ROLE, compliance.address);
+      await contract.connect(compliance).setUserVerification(user1.address, true);
+      await contract.connect(compliance).setUserVerification(user2.address, true);
+      
+      const assetId = 0;
+      await contract.registerAsset(user1.address, "ipfs://test", "property", ethers.parseEther("100"));
+      await contract.connect(compliance).setCompliance(assetId, true);
+      await contract.setAssetStatus(assetId, 1);
+      
+      // Remove compliance
+      await contract.connect(compliance).setCompliance(assetId, false);
+      
+      // Transfer should fail
+      await expect(
+        contract.connect(user1).transferFrom(user1.address, user2.address, assetId)
+      ).to.be.revertedWith("Asset not compliant");
+    });
+
+    it("Should prevent transfer to unverified user via transferWithPrice", async function () {
+      const { contract, owner, compliance, user1, user2 } = await loadFixture(deployAssetTokenizationFixture);
+      const COMPLIANCE_ROLE = await contract.COMPLIANCE_ROLE();
+      
+      await contract.grantRole(COMPLIANCE_ROLE, compliance.address);
+      await contract.connect(compliance).setUserVerification(user1.address, true);
+      // user2 is NOT verified
+      
+      const assetId = 0;
+      await contract.registerAsset(user1.address, "ipfs://test", "property", ethers.parseEther("100"));
+      await contract.connect(compliance).setCompliance(assetId, true);
+      await contract.setAssetStatus(assetId, 1);
+      
+      await expect(
+        contract.connect(user1).transferWithPrice(user1.address, user2.address, assetId, ethers.parseEther("50"))
+      ).to.be.revertedWith("Recipient not verified");
+    });
+
+    it("Should handle batch verification with duplicate addresses", async function () {
+      const { contract, owner, compliance, user1 } = await loadFixture(deployAssetTokenizationFixture);
+      const COMPLIANCE_ROLE = await contract.COMPLIANCE_ROLE();
+      
+      await contract.grantRole(COMPLIANCE_ROLE, compliance.address);
+      
+      // Same address multiple times
+      const users = [user1.address, user1.address, user1.address];
+      
+      await expect(
+        contract.connect(compliance).batchVerifyUsers(users, true)
+      ).to.emit(contract, "BatchVerificationCompleted")
+        .withArgs(3, true);
+      
+      expect(await contract.verifiedUsers(user1.address)).to.be.true;
+    });
+
+    it("Should maintain correct owner after failed transfer", async function () {
+      const { contract, owner, compliance, user1, user2 } = await loadFixture(deployAssetTokenizationFixture);
+      const COMPLIANCE_ROLE = await contract.COMPLIANCE_ROLE();
+      
+      await contract.grantRole(COMPLIANCE_ROLE, compliance.address);
+      await contract.connect(compliance).setUserVerification(user1.address, true);
+      // user2 not verified
+      
+      const assetId = 0;
+      await contract.registerAsset(user1.address, "ipfs://test", "property", ethers.parseEther("100"));
+      await contract.connect(compliance).setCompliance(assetId, true);
+      await contract.setAssetStatus(assetId, 1);
+      
+      // Try transfer to unverified user
+      await expect(
+        contract.connect(user1).transferFrom(user1.address, user2.address, assetId)
+      ).to.be.revertedWith("Recipient not verified");
+      
+      // Owner should still be user1
+      expect(await contract.ownerOf(assetId)).to.equal(user1.address);
+    });
+  });
 });
+
 
